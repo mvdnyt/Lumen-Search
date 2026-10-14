@@ -1,0 +1,18 @@
+# Generated application and Windows shortcut
+Lumen.exe
+*.lnk
+
+# Machine-specific preferences, diagnostics and reverse-engineering reports
+startup-preference.txt
+startup-error.txt
+verification.txt
+glass-status.txt
+runtime-measurements.json
+rea-evidence.json
+
+# Build and editor caches
+bin/
+obj/
+.vs/
+*.user
+*.suo
