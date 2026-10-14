@@ -166,6 +166,14 @@ namespace Lumen {
   List<Result> current=new List<Result>();int selected,generation,hotkey,hotkeyError;bool fileBusy,quitting,closing,reducedMotion,ready,glassEnabled;
   float dpi=1;string message="";double opacity=1,animationStart,animationEnd;Stopwatch animationClock=new Stopwatch(),resizeClock=new Stopwatch();int resizeFrom,resizeTo;int lastLayeredError;
   int clippedWidth=-1,clippedHeight=-1;bool clippedExpanded;
+  bool morphing;
+  double morphProgress=1;
+  const double MorphDurationMs=400;
+
+  static double MorphEase(double value) {
+   value=Math.Max(0,Math.Min(1,value));
+   return 1-Math.Pow(1-value,3);
+  }
   System.Drawing.Font inputFont,titleFont,detailFont,hintFont;System.Drawing.Bitmap frame;
   readonly System.Drawing.Color ink=System.Drawing.Color.FromArgb(239,240,243);
   protected override Forms.CreateParams CreateParams {get {var cp=base.CreateParams;cp.ExStyle|=0x80000;return cp;}}
@@ -187,7 +195,17 @@ namespace Lumen {
   }
   int S(int n){return (int)Math.Round(n*dpi);}
   int PillWidth {get {return Width-S(24);}}
-  System.Drawing.Rectangle Pill {get {return new System.Drawing.Rectangle(S(12),S(12),PillWidth,S(54));}}
+  System.Drawing.Rectangle Pill {
+   get {
+    if(!morphing)
+     return new System.Drawing.Rectangle(S(12),S(12),PillWidth,S(54));
+    double grow=MorphEase(morphProgress/.35);
+    double stretch=MorphEase((morphProgress-.18)/.82);
+    int height=S(14)+(int)((S(54)-S(14))*grow);
+    int width=height+(int)((PillWidth-height)*stretch);
+    return new System.Drawing.Rectangle((Width-width)/2,S(39)-height/2,width,height);
+   }
+  }
   void TryBackdrop(){try {using(var key=Microsoft.Win32.Registry.CurrentUser.OpenSubKey("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")){if(key!=null&&Convert.ToInt32(key.GetValue("EnableTransparency",1))==0)reducedMotion=true;}}catch(System.Security.SecurityException){}
    // Accent blur on a layered HWND can create an opaque rectangular backing surface.
    // Let the layered bitmap supply the alpha instead; text and icons retain their own opacity.
@@ -205,12 +223,76 @@ namespace Lumen {
   protected override void WndProc(ref Forms.Message m){if(m.Msg==0x14){m.Result=new IntPtr(1);return;}if(m.Msg==0x0312){if(Visible&&!closing)Dismiss();else Reveal();return;}if(m.Msg==0x84){base.WndProc(ref m);if(m.Result==new IntPtr(1)){int x=(short)(m.LParam.ToInt64()&0xffff),y=(short)((m.LParam.ToInt64()>>16)&0xffff);var p=PointToClient(new System.Drawing.Point(x,y));if(!HitSurface(p))m.Result=new IntPtr(-1);}return;}base.WndProc(ref m);}
   bool HitSurface(System.Drawing.Point p){if(Pill.Contains(p))return true;return input!=null&&input.Text.Trim().Length>0&&p.Y>=S(82)&&p.X>=S(12)&&p.X<=Width-S(12);}
   void RefreshApps(){Task.Run(delegate{Search.LoadApps();if(!IsDisposed)try{BeginInvoke(new Action(delegate {if(!IsDisposed)UpdateResults();}));}catch(InvalidOperationException){}});}
-  public void Reveal(){closing=false;animation.Stop();opacity=1;var area=Forms.Screen.FromPoint(Forms.Cursor.Position).WorkingArea;Width=Math.Min(S(664),area.Width-S(24));input.Clear();UpdateResults();Location=new System.Drawing.Point(area.Left+(area.Width-Width)/2,area.Top+Math.Max(S(16),(int)(area.Height*.27)));if(!reducedMotion)opacity=.04;Show();Activate();SetForegroundWindow(Handle);input.Focus();Render();if(!reducedMotion)Fade(1);}
+  public void Reveal()
+{
+    // Hide the previous frame before resetting the animation.
+    Hide();
+    closing = false;
+    animation.Stop();
+    resizeAnimation.Stop();
+
+    opacity = 1;
+    morphing = !reducedMotion;
+    morphProgress = morphing ? 0 : 1;
+    clippedWidth = -1;
+
+    var area = Forms.Screen
+        .FromPoint(Forms.Cursor.Position).WorkingArea;
+
+    Width = Math.Min(S(664), area.Width - S(24));
+    input.Clear();
+    UpdateResults();
+
+    Height = S(82);
+    resizeAnimation.Stop();
+
+    Location = new System.Drawing.Point(
+        area.Left + (area.Width - Width) / 2,
+        area.Top + Math.Max(S(16), (int)(area.Height * .27)));
+
+    // Prepare the dot before making the window visible.
+    Render();
+    Show();
+
+    Activate();
+    SetForegroundWindow(Handle);
+    input.Focus();
+
+    if (morphing)
+        Fade(1);
+}
   void Fade(double end){animationStart=opacity;animationEnd=end;animationClock.Restart();animation.Start();}
-  void AnimateTick(object s,EventArgs a){double t=Math.Min(1,animationClock.Elapsed.TotalMilliseconds/(closing?90:150));opacity=animationStart+(animationEnd-animationStart)*(1-Math.Pow(1-t,3));Render();if(t>=1){animation.Stop();if(closing)FinishHide();else opacity=1;}}
+  void AnimateTick(object sender,EventArgs args) {
+   double duration=closing?90:morphing?MorphDurationMs:150;
+   double t=Math.Min(1,animationClock.Elapsed.TotalMilliseconds/duration);
+   if(morphing&&!closing) {
+    morphProgress=t;
+    opacity=1;
+    // The native rounded region must follow every morph frame.
+    clippedWidth=-1;
+    if(t>=1)morphing=false;
+   } else {
+    opacity=animationStart+(animationEnd-animationStart)*MorphEase(t);
+   }
+   Render();
+   if(t>=1) {
+    animation.Stop();
+    if(closing)FinishHide();
+    else opacity=1;
+   }
+  }
   void Dismiss(){if(closing||!Visible)return;closing=true;debounce.Stop();resizeAnimation.Stop();if(cancel!=null)cancel.Cancel();generation++;if(reducedMotion)FinishHide();else Fade(0);}
-  void FinishHide(){Hide();current.Clear();closing=false;opacity=1;}
-  void UpdateResults(){if(!ready)return;generation++;if(cancel!=null)cancel.Cancel();debounce.Stop();current=Search.Local(input.Text);selected=0;message=Search.IndexStatus;ResizeResults();if(input.Text.Trim().Length>=2)debounce.Start();}
+  void FinishHide(){Hide();current.Clear();closing=false;opacity=1;morphing=false;morphProgress=1;clippedWidth=-1;}
+  void UpdateResults(){if(!ready)return;
+   // Start searching immediately if the user types during the opening animation.
+   if(morphing&&input.Text.Length>0) {
+    morphing=false;
+    morphProgress=1;
+    opacity=1;
+    animation.Stop();
+    clippedWidth=-1;
+   }
+   generation++;if(cancel!=null)cancel.Cancel();debounce.Stop();current=Search.Local(input.Text);selected=0;message=Search.IndexStatus;ResizeResults();if(input.Text.Trim().Length>=2)debounce.Start();}
   void ResizeResults(){var area=Forms.Screen.FromPoint(Forms.Cursor.Position).WorkingArea;int limit=Math.Max(2,(area.Height-(int)(area.Height*.27)-S(142))/S(54));if(current.Count>limit)current=current.Take(limit).ToList();selected=Math.Min(selected,current.Count-1);resizeTo=input.Text.Trim().Length==0?S(82):S(126+Math.Max(1,current.Count)*54);resizeAnimation.Stop();if(Visible&&!reducedMotion&&!closing){resizeFrom=Height;resizeClock.Restart();resizeAnimation.Start();}else Height=resizeTo;Render();}
   async void FilesTick(object s,EventArgs a){debounce.Stop();if(fileBusy){debounce.Start();return;}fileBusy=true;string query=input.Text.Trim();int version=generation;var request=new CancellationTokenSource();cancel=request;
    try{var files=await Task.Run(()=>Search.Files(query,request.Token));if(version!=generation||!Visible||closing||IsDisposed)return;string chosen=selected>=0&&selected<current.Count?current[selected].Target:null;int index=current.FindIndex(x=>x.Kind=="web");if(index<0)index=current.Count;var targets=new HashSet<string>(current.Select(x=>x.Target),StringComparer.OrdinalIgnoreCase);current.InsertRange(index,files.Where(x=>targets.Add(x.Target)));selected=Math.Max(0,current.FindIndex(x=>x.Target==chosen));message=Search.IndexStatus;ResizeResults();}catch(OperationCanceledException){}finally{fileBusy=false;if(cancel==request)cancel=null;request.Dispose();}}
@@ -224,8 +306,11 @@ namespace Lumen {
   void Render(){if(!ready||IsDisposed)return;ClipWindow();if(frame!=null)frame.Dispose();frame=MakeFrame();PushFrame();}
   void PushFrame(){if(frame==null)return;IntPtr screen=GetDC(IntPtr.Zero),dc=CreateCompatibleDC(screen),bitmap=IntPtr.Zero,old=IntPtr.Zero;try{bitmap=frame.GetHbitmap(System.Drawing.Color.FromArgb(0));old=SelectObject(dc,bitmap);var dest=new NativePoint(Left,Top);var size=new NativeSize{Width=Width,Height=Height};var origin=new NativePoint(0,0);var blend=new Blend{Operation=0,Flags=0,Alpha=(byte)(Math.Max(0,Math.Min(1,opacity))*255),Format=1};if(!UpdateLayeredWindow(Handle,screen,ref dest,ref size,dc,ref origin,0,ref blend,2))lastLayeredError=Marshal.GetLastWin32Error();else lastLayeredError=0;}finally{if(old!=IntPtr.Zero)SelectObject(dc,old);if(bitmap!=IntPtr.Zero)DeleteObject(bitmap);DeleteDC(dc);ReleaseDC(IntPtr.Zero,screen);}}
   System.Drawing.Bitmap MakeFrame(){var image=new System.Drawing.Bitmap(Math.Max(1,Width),Math.Max(1,Height),System.Drawing.Imaging.PixelFormat.Format32bppPArgb);using(var g=System.Drawing.Graphics.FromImage(image)){g.Clear(System.Drawing.Color.Transparent);g.SmoothingMode=System.Drawing.Drawing2D.SmoothingMode.AntiAlias;g.TextRenderingHint=System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
-    Matte(g,Pill,S(27),false);using(var pen=new System.Drawing.Pen(System.Drawing.Color.FromArgb(169,176,188),S(2))){g.DrawEllipse(pen,S(31),S(29),S(15),S(15));g.DrawLine(pen,S(44),S(43),S(51),S(50));}
+    Matte(g,Pill,S(27),false);
+    if(!morphing) {
+    using(var pen=new System.Drawing.Pen(System.Drawing.Color.FromArgb(169,176,188),S(2))){g.DrawEllipse(pen,S(31),S(29),S(15),S(15));g.DrawLine(pen,S(44),S(43),S(51),S(50));}
     DrawInput(g);
+    }
     if(input.Text.Trim().Length>0){var panel=new System.Drawing.Rectangle(S(12),S(82),Width-S(24),Math.Max(S(30),Height-S(94)));Matte(g,panel,S(18),false);
      for(int i=0;i<current.Count;i++){int y=S(92+i*54);if(i==selected)using(var brush=new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(45,47,53)))using(var path=Rounded(new System.Drawing.Rectangle(S(22),y,Width-S(44),S(50)),S(11)))g.FillPath(brush,path);
       var r=current[i];var icon=(r.Kind=="app"||r.Kind=="file"||r.Kind=="setting")?icons.Get(r.Target):null;if(icon!=null)g.DrawImage(icon,new System.Drawing.Rectangle(S(35),y+S(11),S(28),S(28)));else DrawFallback(g,r.Kind,new System.Drawing.Rectangle(S(35),y+S(11),S(28),S(28)));
@@ -251,7 +336,15 @@ namespace Lumen {
   public void StartupFailed(string error){tray.ShowBalloonTip(5000,"Lumen startup","Couldn't enable startup. Use Start with Windows in the tray menu to retry.",Forms.ToolTipIcon.Info);}
   protected override void Dispose(bool disposing){if(disposing&&!IsDisposed){ready=false;generation++;if(cancel!=null)cancel.Cancel();debounce.Dispose();animation.Dispose();resizeAnimation.Dispose();icons.Dispose();if(hotkey!=0)UnregisterHotKey(Handle,hotkey);tray.Visible=false;tray.Dispose();inputFont.Dispose();titleFont.Dispose();detailFont.Dispose();hintFont.Dispose();if(frame!=null)frame.Dispose();}base.Dispose(disposing);}
   public void VerifyUi(Action<string,bool> check){if(hotkeyError==5)check("shortcut denied by host; tray fallback available",tray.Visible);else check("global hotkey registered (Win32 error "+hotkeyError+")",hotkey!=0);
-   Reveal();check("empty search is compact",current.Count==0&&resizeTo==S(82));using(var image=Snapshot()){image.Save(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"preview-compact.png"));check("no category buttons; full width search pill",Pill.Width==Width-S(24));check("window excludes rectangular corners",Region!=null&&!Region.IsVisible(0,0)&&!Region.IsVisible(Width-1,0));check("window retains the rounded pill",Region.IsVisible(Pill.Left+Pill.Width/2,Pill.Top+Pill.Height/2));check("outside pill bitmap is fully transparent",image.GetPixel(0,0).A==0&&image.GetPixel(Width-1,0).A==0);check("matte pill is fully opaque",image.GetPixel(Pill.Left+Pill.Width/2,Pill.Top+S(10)).A==255);}
+   Reveal();
+   if(morphing) {
+    var settle=Stopwatch.StartNew();
+    while(morphing&&settle.ElapsedMilliseconds<1000) {
+     Forms.Application.DoEvents();
+     Thread.Sleep(5);
+    }
+   }
+   check("empty search is compact",current.Count==0&&resizeTo==S(82));using(var image=Snapshot()){image.Save(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"preview-compact.png"));check("no category buttons; full width search pill",Pill.Width==Width-S(24));check("window excludes rectangular corners",Region!=null&&!Region.IsVisible(0,0)&&!Region.IsVisible(Width-1,0));check("window retains the rounded pill",Region.IsVisible(Pill.Left+Pill.Width/2,Pill.Top+Pill.Height/2));check("outside pill bitmap is fully transparent",image.GetPixel(0,0).A==0&&image.GetPixel(Width-1,0).A==0);check("matte pill is fully opaque",image.GetPixel(Pill.Left+Pill.Width/2,Pill.Top+S(10)).A==255);}
    check("native text editor focused",input.Focused);input.Clear();foreach(char c in "notepad")SendMessage(input.Handle,0x0102,new IntPtr(c),IntPtr.Zero);check("native character input reaches search",input.Text=="notepad");check("typed query selects Notepad",current.Count>0&&current[0].Name=="Notepad");Keys(input,new Forms.KeyEventArgs(Forms.Keys.Down));check("down arrow advances selection",selected==1);Keys(input,new Forms.KeyEventArgs(Forms.Keys.Up));check("up arrow restores selection",selected==0);
    input.Text="wifi";check("Wi-Fi settings alias ranks first",current.Count>0&&current[0].Target=="ms-settings:network-wifi");input.Text="settings bluetooth";check("settings prefix finds Bluetooth",current.Count>0&&current[0].Target=="ms-settings:bluetooth");input.Text="display settings";check("settings suffix finds Display",current.Count>0&&current[0].Target=="ms-settings:display");input.Text="2+3*4";check("calculator appears first",current[0].Name=="14");
    Dismiss();Reveal();check("reopen during fade stays visible",Visible&&!closing);input.Text="bluetooth";for(int i=0;i<35;i++){Forms.Application.DoEvents();Thread.Sleep(10);}Render();check("native layered frame applied (error "+lastLayeredError+")",lastLayeredError==0);check("real shell icons cached",icons.Count>0);check("icon cache stays bounded",icons.Count<=64);using(var image=Snapshot())image.Save(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"preview.png"));
